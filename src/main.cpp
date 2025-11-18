@@ -27,6 +27,9 @@ struct HistoricoData {
 HistoricoData historico; 
 float temperaturaAtualSensor = 0.0; 
 
+// --- CONFIGURAÇÕES DA EEPROM ---
+#define EEPROM_SIZE 32 // Tamanho em bytes
+
 // --- OBJETOS GLOBAIS ---
 Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 OneWire oneWire(PINO_SENSOR);
@@ -35,6 +38,9 @@ DallasTemperature sensors(&oneWire);
 // --- FREERTOS ---
 SemaphoreHandle_t xMutex;
 TaskHandle_t taskInputHandle;
+
+// --- PROTÓTIPOS DAS FUNÇÕES ---
+void desenharInterface(float tAtual, HistoricoData dados);
 
 // ==========================================
 // TAREFA DO CORE 0: Gestão dos Botões e EEPROM
@@ -101,9 +107,9 @@ void setup() {
   Serial.begin(115200);
   
   pinMode(PIN_BOTAO_SAVE, INPUT_PULLUP);
-  pinMode(PIN_BOTAO_RESET, INPUT_PULLUP); // Configura novo botão
+  pinMode(PIN_BOTAO_RESET, INPUT_PULLUP);
   
-  Wire.begin(21, 22);
+  Wire.begin(21, 22); // Inicializa I2C (SDA, SCL)
   
   if(!display.begin(I2C_ADDRESS, true)) { 
     Serial.println(F("Erro SH1106"));
@@ -119,11 +125,13 @@ void setup() {
   display.display();
   delay(1000);
 
+  // Inicializa sensor de temperatura DS18B20
   sensors.begin();
   sensors.setResolution(12);
   sensors.setWaitForConversion(false);
 
-  if (!EEPROM.begin(64)) {
+  // Inicializa EEPROM
+  if (!EEPROM.begin(EEPROM_SIZE)) {
     Serial.println("Erro EEPROM");
   } else {
     EEPROM.get(0, historico);
@@ -136,8 +144,43 @@ void setup() {
     }
   }
 
+  // Inicializa Mutex e Tarefa de Input (Core 0) - RTOS
   xMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(TaskInput, "InputTask", 4096, NULL, 1, &taskInputHandle, 0);
+}
+
+// ==========================================
+// LOOP PRINCIPAL (CORE 1)
+// ==========================================
+void loop() {
+  static unsigned long lastRead = 0;
+  
+  // Leitura Sensor
+  if (millis() - lastRead >= 2000) {
+    lastRead = millis();
+    float t = sensors.getTempCByIndex(0);
+    sensors.requestTemperatures();
+    
+    if (t > -100.0) {
+      if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+        temperaturaAtualSensor = t;
+        xSemaphoreGive(xMutex);
+      }
+    }
+  }
+
+  // Preparação para Display
+  float tDisplay = 0;
+  HistoricoData hDisplay;
+
+  if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+    tDisplay = temperaturaAtualSensor;
+    hDisplay = historico;
+    xSemaphoreGive(xMutex);
+  }
+
+  desenharInterface(tDisplay, hDisplay);
+  vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 // ==========================================
@@ -191,38 +234,4 @@ void desenharInterface(float tAtual, HistoricoData dados) {
   }
 
   display.display();
-}
-
-// ==========================================
-// LOOP PRINCIPAL (CORE 1)
-// ==========================================
-void loop() {
-  static unsigned long lastRead = 0;
-  
-  // Leitura Sensor
-  if (millis() - lastRead >= 2000) {
-    lastRead = millis();
-    float t = sensors.getTempCByIndex(0);
-    sensors.requestTemperatures();
-    
-    if (t > -100.0) {
-      if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
-        temperaturaAtualSensor = t;
-        xSemaphoreGive(xMutex);
-      }
-    }
-  }
-
-  // Preparação para Display
-  float tDisplay = 0;
-  HistoricoData hDisplay;
-
-  if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
-    tDisplay = temperaturaAtualSensor;
-    hDisplay = historico; 
-    xSemaphoreGive(xMutex);
-  }
-
-  desenharInterface(tDisplay, hDisplay);
-  vTaskDelay(pdMS_TO_TICKS(100));
 }
