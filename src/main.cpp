@@ -1,19 +1,20 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h> // Voltamos para a biblioteca correta
+#include <Adafruit_SH110X.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <EEPROM.h>
 #include "freertos/semphr.h"
 
 // --- CONFIGURAÇÕES DE HARDWARE ---
-#define PINO_SENSOR 4
-#define PIN_BOTAO   27  
-#define I2C_ADDRESS 0x3C 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1   
+#define PINO_SENSOR     4
+#define PIN_BOTAO_SAVE  27  // Botão para guardar medida (GND)
+#define PIN_BOTAO_RESET 14  // NOVO: Botão para limpar memória (GND)
+#define I2C_ADDRESS     0x3C 
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1   
 
 // --- ESTRUTURA DE DADOS ---
 struct HistoricoData {
@@ -27,9 +28,7 @@ HistoricoData historico;
 float temperaturaAtualSensor = 0.0; 
 
 // --- OBJETOS GLOBAIS ---
-// Instância para SH1106 (A que funcionava no seu primeiro código)
 Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
 OneWire oneWire(PINO_SENSOR);
 DallasTemperature sensors(&oneWire);
 
@@ -38,35 +37,60 @@ SemaphoreHandle_t xMutex;
 TaskHandle_t taskInputHandle;
 
 // ==========================================
-// TAREFA DO CORE 0: Botão e EEPROM
+// TAREFA DO CORE 0: Gestão dos Botões e EEPROM
 // ==========================================
 void TaskInput(void *pvParameters) {
-  unsigned long lastDebounce = 0;
+  unsigned long lastDebounceSave = 0;
+  unsigned long lastDebounceReset = 0;
 
   for (;;) {
-    if (digitalRead(PIN_BOTAO) == LOW) {
-      if (millis() - lastDebounce > 500) { 
-        lastDebounce = millis();
-
-        Serial.println("Botão pressionado! Salvando...");
+    
+    // --- 1. LÓGICA BOTÃO SALVAR (GPIO 27) ---
+    if (digitalRead(PIN_BOTAO_SAVE) == LOW) {
+      if (millis() - lastDebounceSave > 500) { 
+        lastDebounceSave = millis();
+        Serial.println("Botão Save: Guardando...");
 
         if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+          // Guarda temperatura atual no slot da vez
           historico.leituras[historico.indiceAtual] = temperaturaAtualSensor;
+          
+          // Avança índice (Circular)
           historico.indiceAtual++;
           if (historico.indiceAtual >= 6) historico.indiceAtual = 0;
 
+          // Grava na Flash
           EEPROM.put(0, historico);
           EEPROM.commit();
-          
-          int indiceGravado = (historico.indiceAtual == 0) ? 5 : historico.indiceAtual - 1;
-          Serial.print("Salvo no indice: ");
-          Serial.println(indiceGravado); 
           
           xSemaphoreGive(xMutex);
         }
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(50)); 
+
+    // --- 2. LÓGICA BOTÃO RESET (GPIO 14) ---
+    if (digitalRead(PIN_BOTAO_RESET) == LOW) {
+      if (millis() - lastDebounceReset > 500) { 
+        lastDebounceReset = millis();
+        Serial.println("Botão Reset: Limpando memória...");
+
+        if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+          // Loop para limpar todas as posições
+          for(int i=0; i<6; i++) {
+            historico.leituras[i] = TEMPERATURA_VAZIA;
+          }
+          historico.indiceAtual = 0; // Reinicia o ponteiro
+
+          // Grava a memória limpa na Flash
+          EEPROM.put(0, historico);
+          EEPROM.commit();
+          
+          xSemaphoreGive(xMutex);
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50)); // Pequeno delay para não bloquear a CPU
   }
 }
 
@@ -76,37 +100,35 @@ void TaskInput(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
   
-  pinMode(PIN_BOTAO, INPUT_PULLUP);
-  Wire.begin(21, 22); // SDA, SCL
+  pinMode(PIN_BOTAO_SAVE, INPUT_PULLUP);
+  pinMode(PIN_BOTAO_RESET, INPUT_PULLUP); // Configura novo botão
   
-  // --- INICIALIZAÇÃO DO DISPLAY SH1106 ---
-  // Usamos begin(I2C_ADDRESS, true) conforme seu código original
+  Wire.begin(21, 22);
+  
   if(!display.begin(I2C_ADDRESS, true)) { 
-    Serial.println(F("Erro SH1106 - Verifique conexões"));
+    Serial.println(F("Erro SH1106"));
     for(;;);
   }
   
+  // Efeito visual de inicialização
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
   display.setTextSize(1);
-  display.setCursor(0,0);
-  display.println("Iniciando...");
+  display.setCursor(10,25);
+  display.println("Sistema Termometro");
   display.display();
   delay(1000);
 
-  // Sensor
   sensors.begin();
   sensors.setResolution(12);
   sensors.setWaitForConversion(false);
 
-  // EEPROM
   if (!EEPROM.begin(64)) {
     Serial.println("Erro EEPROM");
   } else {
     EEPROM.get(0, historico);
-    // Validação de integridade
+    // Validação
     if (historico.indiceAtual < 0 || historico.indiceAtual > 5) {
-      Serial.println("Resetando memória...");
       historico.indiceAtual = 0;
       for(int i=0; i<6; i++) historico.leituras[i] = TEMPERATURA_VAZIA;
       EEPROM.put(0, historico);
@@ -119,31 +141,30 @@ void setup() {
 }
 
 // ==========================================
-// DESENHO (INTERFACE GRÁFICA)
+// DESENHO DA INTERFACE
 // ==========================================
 void desenharInterface(float tAtual, HistoricoData dados) {
-  display.clearDisplay(); // Limpa o buffer anterior
-  
-  // IMPORTANTE: Redefinir a cor sempre
+  display.clearDisplay(); 
   display.setTextColor(SH110X_WHITE);
 
-  // --- Cabeçalho ---
+  // --- CABEÇALHO (Temperatura Principal) ---
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print("Sensor:");
+  display.print("Atual:");
   
   display.setTextSize(2);
   display.setCursor(50, 0);
-  display.print(tAtual, 1);
+  // MUDANÇA: '2' casas decimais
+  display.print(tAtual, 2);
   
   display.setTextSize(1); 
   display.cp437(true); 
-  display.write(248); // Símbolo Grau
+  display.write(248); 
   display.print("C"); 
 
   display.drawLine(0, 18, 128, 18, SH110X_WHITE); 
 
-  // --- Lista ---
+  // --- LISTA DE MEDIÇÕES ---
   display.setTextSize(1);
   int yBase = 24; 
   int alturaLinha = 12;
@@ -156,11 +177,12 @@ void desenharInterface(float tAtual, HistoricoData dados) {
     display.print(i + 1);
     display.print(":");
 
-    if (dados.leituras[i] <= -900) { // Checagem de segurança para valor vazio
+    if (dados.leituras[i] <= -900) { 
       display.print("--.--");
     } else {
       display.print(dados.leituras[i], 2); 
       
+      // Marcador da última gravação
       int lastIndex = (dados.indiceAtual == 0) ? 5 : dados.indiceAtual - 1;
       if (i == lastIndex) {
         display.print("<");
@@ -168,16 +190,16 @@ void desenharInterface(float tAtual, HistoricoData dados) {
     }
   }
 
-  display.display(); // Envia o buffer para a tela
+  display.display();
 }
 
 // ==========================================
-// LOOP (CORE 1)
+// LOOP PRINCIPAL (CORE 1)
 // ==========================================
 void loop() {
   static unsigned long lastRead = 0;
   
-  // Leitura Sensor a cada 2s
+  // Leitura Sensor
   if (millis() - lastRead >= 2000) {
     lastRead = millis();
     float t = sensors.getTempCByIndex(0);
@@ -191,20 +213,16 @@ void loop() {
     }
   }
 
-  // Prepara dados para display
+  // Preparação para Display
   float tDisplay = 0;
   HistoricoData hDisplay;
 
-  // Snapshot seguro dos dados
   if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
     tDisplay = temperaturaAtualSensor;
     hDisplay = historico; 
     xSemaphoreGive(xMutex);
   }
 
-  // Desenha
   desenharInterface(tDisplay, hDisplay);
-  
-  // Delay para estabilidade do Core 1
   vTaskDelay(pdMS_TO_TICKS(100));
 }
